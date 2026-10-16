@@ -311,6 +311,7 @@ static uint32_t Qm;                             /* the master angle: axle 0 at Q
 static int32_t lift;                            /* the float height above the ground (Q4) */
 static char line1[40], line2[40];
 static int linked;
+static uint16_t frame_no;                       /* frames drawn: the shadow grids are this frame's when stamped so */
 
 static void frame_setup(uint32_t now)
 {
@@ -328,6 +329,7 @@ static void frame_setup(uint32_t now)
     if (wave < 0) wave = 0;
     bob = (sine(now * 1431655u) * 3 * Q4) >> 15;          /* +-3 px, every 3 s */
     lift = 8 * Q4 + bob;
+    frame_no++;                                 /* (the shadow grids are stale now) */
     for (a = 0; a < NAX; a++) {
         ax_cx[a] = ax_x[a];
         ax_cy[a] = ax_y[a] - bob;
@@ -336,15 +338,73 @@ static void frame_setup(uint32_t now)
     }
 }
 
+/* Shadows are soft, so they are worked out on a coarse grid once a frame and blended between its points:
+ * on the ground (every 4 px), and on the discs of heights 0 and 1 from those above (every 2 px). */
+#define CLOCK_H 152                             /* the clockwork and its shadows stay above this row */
+#define SG_W 61
+#define SG_H (CLOCK_H / 4 + 1)
+#define SD_W 121
+#define SD_H (CLOCK_H / 2 + 1)
+static uint8_t sg_mask[SG_H][SG_W], sd_mask[2][SD_H][SD_W];
+static uint16_t sg_done[SG_H], sd_done[SD_H];
+static uint8_t ZORD[NDISC];                     /* the discs, top down */
+
+static int32_t union_at(int32_t px, int32_t py, int32_t zmin, int32_t zrecv, int32_t ground)
+{   /* how much of (px, py) the discs at zmin and up shadow (0..255) */
+    int32_t i, s = 0;
+    for (i = 0; i < NDISC; i++) {
+        const disc_t *d = &disc[i];
+        int32_t h, c;
+        if (d->z < zmin) continue;
+        h = ground ? lift + d->z * 3 * Q4 : (d->z - zrecv) * 3 * Q4;
+        c = disc_at(d, px - h * 6 / 10, py - h * 8 / 10, ground ? 3 + h / (4 * Q4) : 2, 0, 0, 0);
+        if (c) s = s + c - ((s * c) >> 8);
+    }
+    return s > 255 ? 255 : s;
+}
+static void mask_rows(int32_t y)                /* the grid rows pixel row y blends between, once a frame */
+{
+    int32_t j, i, k;
+    for (k = 0; k < 2; k++) {
+        j = (y >> 2) + k;
+        if (j < SG_H && sg_done[j] != frame_no) {
+            sg_done[j] = frame_no;
+            for (i = 0; i < SG_W; i++)
+                sg_mask[j][i] = (uint8_t)union_at((i << 2) * Q4 + Q4 / 2, (j << 2) * Q4 + Q4 / 2, 0, 0, 1);
+        }
+        j = (y >> 1) + k;
+        if (j < SD_H && sd_done[j] != frame_no) {
+            sd_done[j] = frame_no;
+            for (i = 0; i < SD_W; i++) {
+                int32_t px = (i << 1) * Q4 + Q4 / 2, py = (j << 1) * Q4 + Q4 / 2;
+                sd_mask[0][j][i] = (uint8_t)union_at(px, py, 1, 0, 0);
+                sd_mask[1][j][i] = (uint8_t)union_at(px, py, 2, 1, 0);
+            }
+        }
+    }
+}
+static int32_t mask_at(const uint8_t *m, int32_t w, int32_t sh, int32_t x, int32_t y)
+{   /* grid m (w wide, a point every 1 << sh px) at pixel (x, y), blended */
+    int32_t i = x >> sh, j = y >> sh, fx = (x - (i << sh)) << (8 - sh), fy = (y - (j << sh)) << (8 - sh);
+    const uint8_t *p = m + j * w + i;
+    int32_t top = p[0] + (((p[1] - p[0]) * fx) >> 8), bot = p[w] + (((p[w + 1] - p[w]) * fx) >> 8);
+    return top + (((bot - top) * fy) >> 8);
+}
+
+static int8_t vig[240];                         /* the ground's vignette, by column */
+
 static void strip_draw(uint32_t s, uint32_t now)
 {
     int32_t y0 = (int32_t)s * STRIP, y1 = y0 + STRIP, x, y, i;
     cv_begin(240, STRIP, C_BLACK);
     for (y = y0; y < y1; y++) {                 /* the ground: deep blue to plum */
         int32_t r = 16 + y * 22 / 240, g = 18 + y * 4 / 240, b = 34 + y * 22 / 240;
-        for (x = 0; x < 240; x++) {
-            int32_t v = (x - 120) * (x - 120) / 900;           /* a little vignette */
-            px_put((uint32_t)(y - y0) * 240u + (uint32_t)x, r - v, g - v, b - v);
+        uint16_t *row = cv_px + (uint32_t)(y - y0) * 240u;
+        for (x = 0; x < 120; x++) {             /* (symmetric: each colour made once) */
+            int32_t v = vig[x], rr = r - v, gg = g - v, bb = b - v;
+            uint16_t c = swap16(RGB(rr < 0 ? 0 : rr, gg < 0 ? 0 : gg, bb < 0 ? 0 : bb));
+            row[x] = c;
+            row[239 - x] = c;
         }
     }
     /* TRY HARD: big, each letter bobbing on its own, a drop shadow under it */
@@ -377,39 +437,39 @@ static void strip_draw(uint32_t s, uint32_t now)
         text_small(26, 205, line1, linked ? 200 : 230, linked ? 240 : 200, linked ? 210 : 150, y0, y1);
         text_small(26, 222, line2, 130, 120, 160, y0, y1);
     }
-    /* the clockwork: shadows on the ground, then the discs bottom up, each shaded by those above it */
-    for (y = y0; y < y1; y++) {
-        int32_t py = y * Q4 + Q4 / 2;
-        if (y > 150) break;
+    /* the clockwork: from the top disc down, until a pixel is covered; the ground's shadow under the rest */
+    for (y = y0; y < y1 && y < CLOCK_H; y++) {
+        int32_t py = y * Q4 + Q4 / 2, nd = 0;
+        uint8_t row[NDISC];
+        for (i = 0; i < NDISC; i++)             /* the discs on this row, top down (disc order: by z) */
+            if (py > ax_cy[disc[ZORD[i]].ax] - disc[ZORD[i]].rt - Q4 && py < ax_cy[disc[ZORD[i]].ax] + disc[ZORD[i]].rt + Q4)
+                row[nd++] = ZORD[i];
+        mask_rows(y);
         for (x = 0; x < 240; x++) {
-            int32_t px = x * Q4 + Q4 / 2, r, g, b, sh = 0, z, any = 0;
+            int32_t px = x * Q4 + Q4 / 2, r = 0, g = 0, b = 0, T = 256, k, sg;
             uint32_t idx = (uint32_t)(y - y0) * 240u + (uint32_t)x;
-            for (i = 0; i < NDISC; i++) {       /* the ground: the light comes from the top left */
-                int32_t h = lift + disc[i].z * 3 * Q4, c;
-                c = disc_at(&disc[i], px - h * 6 / 10, py - h * 8 / 10, 3 + h / (4 * Q4), 0, 0, 0);
-                if (c) { sh = sh + c - ((sh * c) >> 8); any = 1; }
-            }
-            for (i = 0; i < NDISC && !any; i++)
-                if (disc_at(&disc[i], px, py, 1, 0, 0, 0)) any = 1;
-            if (!any)
-                continue;
-            px_get(idx, &r, &g, &b);
-            r -= (r * sh * 150) >> 16; g -= (g * sh * 150) >> 16; b -= (b * sh * 150) >> 16;
-            for (z = 0; z < 3; z++)
-                for (i = 0; i < NDISC; i++) {
-                    int32_t dr, dg, db, c, j, s2 = 0;
-                    if (disc[i].z != z) continue;
-                    c = disc_at(&disc[i], px, py, 1, &dr, &dg, &db);
-                    if (!c) continue;
-                    for (j = 0; j < NDISC; j++) {           /* shadows of the discs above */
-                        int32_t h = (disc[j].z - z) * 3 * Q4, cj;
-                        if (disc[j].z <= z) continue;
-                        cj = disc_at(&disc[j], px - h * 6 / 10, py - h * 8 / 10, 2, 0, 0, 0);
-                        if (cj) s2 = s2 + cj - ((s2 * cj) >> 8);
-                    }
+            for (k = 0; k < nd && T; k++) {
+                const disc_t *d = &disc[row[k]];
+                int32_t dr, dg, db, c, s2;
+                if (px < ax_cx[d->ax] - d->rt - Q4 || px > ax_cx[d->ax] + d->rt + Q4) continue;
+                c = disc_at(d, px, py, 1, &dr, &dg, &db);
+                if (!c) continue;
+                if (d->z < 2 && (s2 = mask_at(sd_mask[d->z][0], SD_W, 1, x, y)) != 0) {   /* the discs above */
                     dr -= (dr * s2 * 120) >> 16; dg -= (dg * s2 * 120) >> 16; db -= (db * s2 * 120) >> 16;
-                    r += ((dr - r) * c) >> 8; g += ((dg - g) * c) >> 8; b += ((db - b) * c) >> 8;
                 }
+                c = (c * T) >> 8;
+                r += (dr * c) >> 8; g += (dg * c) >> 8; b += (db * c) >> 8;
+                T -= c;
+            }
+            sg = mask_at(sg_mask[0], SG_W, 2, x, y);
+            if (T == 256 && !sg)
+                continue;                       /* bare ground */
+            if (T) {
+                int32_t gr, gg, gb;
+                px_get(idx, &gr, &gg, &gb);
+                gr -= (gr * sg * 150) >> 16; gg -= (gg * sg * 150) >> 16; gb -= (gb * sg * 150) >> 16;
+                r += (gr * T) >> 8; g += (gg * T) >> 8; b += (gb * T) >> 8;
+            }
             px_put(idx, r, g, b);
         }
     }
@@ -559,6 +619,15 @@ static void app_main(void)
 {
     uint32_t s = 0;
     gears_init();
+    {
+        uint32_t i, n = 0;
+        int32_t z;
+        for (z = 2; z >= 0; z--)
+            for (i = 0; i < NDISC; i++)
+                if (disc[i].z == z) ZORD[n++] = (uint8_t)i;
+        for (i = 0; i < 240u; i++)
+            vig[i] = (int8_t)(((int32_t)i - 120) * ((int32_t)i - 120) / 900);
+    }
     title_s = (226 * 256) / text_w(&FONT_L, TITLE);
     if (title_s > 2 * 256) title_s = 2 * 256;
     title_x = (240 - ((text_w(&FONT_L, TITLE) * title_s) >> 8)) / 2;
@@ -568,7 +637,7 @@ static void app_main(void)
         panel_out();
         midi_in();
         leds();
-        put_s(line1, linked ? "linked to the emulator" : "waiting for the emulator page");
+        put_s(line1, linked ? "linked to the emulator" : "waiting for the page");
         if (s == 0) frame_setup(fm1_ms);
         strip_draw(s, fm1_ms);
         if (++s * STRIP >= 240u) s = 0;
