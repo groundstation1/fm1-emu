@@ -339,7 +339,7 @@ static void frame_setup(void)
     th_kick = 0;
     diff = target - (int32_t)Qm;                /* the short way round */
     if (diff > QWRAP / 2) diff -= QWRAP;
-    if (diff < -QWRAP / 2) diff += QWRAP;
+    if (-diff > QWRAP / 2) diff += QWRAP;       /* (not "diff < -QWRAP / 2": that constant looks like a ROM address) */
     diff = diff / 3 ? diff / 3 : diff;          /* a third of the way each frame */
     Qm = (uint32_t)(((int32_t)Qm + diff) % QWRAP + QWRAP) % QWRAP;
     for (a = 0; a < NAX; a++)
