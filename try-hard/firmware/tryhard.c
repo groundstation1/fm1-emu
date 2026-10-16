@@ -337,9 +337,10 @@ static void frame_setup(void)
     uint32_t a;
     target = (target + th_kick % QWRAP + QWRAP) % QWRAP;
     th_kick = 0;
-    diff = target - (int32_t)Qm;                /* the short way round */
-    if (diff > QWRAP / 2) diff -= QWRAP;
-    if (-diff > QWRAP / 2) diff += QWRAP;       /* (not "diff < -QWRAP / 2": that constant looks like a ROM address) */
+    {   /* the short way round, in unsigned steps forward: -QWRAP / 2 as a constant looks like a ROM address */
+        uint32_t fwd = ((uint32_t)target + (uint32_t)QWRAP - Qm) % (uint32_t)QWRAP;
+        diff = fwd > (uint32_t)QWRAP / 2u ? (int32_t)fwd - QWRAP : (int32_t)fwd;
+    }
     diff = diff / 3 ? diff / 3 : diff;          /* a third of the way each frame */
     Qm = (uint32_t)(((int32_t)Qm + diff) % QWRAP + QWRAP) % QWRAP;
     for (a = 0; a < NAX; a++)
