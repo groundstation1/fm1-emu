@@ -5,15 +5,15 @@ sends every key, button, encoder and the MASTER knob over USB-MIDI to [the emula
 which plays the firmware it runs from them and sends its LEDs back. Play any firmware on the list with real keys and
 knobs, without installing it. ([Issue #7](https://github.com/joakimeriksson/fm1-emu/issues/7).)
 
-<p align="center"><img src="docs/screen.gif" width="240" alt="Try Hard's screen: brass, steel and copper gears turning over a big wobbling TRY HARD, the link to the page under it"></p>
+<p align="center"><img src="docs/screen.png" width="240" alt="Try Hard's screen: brass, steel and copper gears over a big TRY HARD, the link to the page under it"></p>
 
-The screen has the CPU to itself, so it draws a clockwork: five axles of compound gears (a wheel and a pinion that
-turn together) on three heights, every pixel shaded each frame: brushed metal with a sheen that stays with the light,
-chamfered teeth and spokes, ruby jewels in the bearings, and soft shadows on the ground and on the gears below. The
-teeth really mesh: each pinion drives the next wheel at the ratio of their teeth, with phases that put a tooth in a
-gap (`tests/mesh_test.c` turns the whole train and checks no two teeth ever overlap). Playing drives it: a key or a
-button speeds it up, a knob turns it either way. Under it a big TRY HARD bobs, and the bottom lines say whether the
-page is linked and what the panel last sent.
+The screen is a clockwork: five axles of compound gears (a wheel and a pinion that turn together) on three
+heights, flat and geometric, with outlines, spoked wheels and ruby jewels in the bearings. The teeth really mesh: each
+pinion drives the next wheel at the ratio of their teeth, with phases that put a tooth in a gap
+(`tests/mesh_test.c` turns the whole train and checks no two teeth ever overlap). Nothing moves by itself: the
+encoders and MASTER turn it, half a tooth of the big wheel a detent, either way. It is drawn from tables made at boot
+(every pixel's distance and angle from its axle), so a frame is lookups and compares, and only the clockwork is
+redrawn; the words under it only when they change.
 
 ## Use it
 

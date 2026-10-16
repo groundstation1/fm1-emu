@@ -6,6 +6,13 @@
 #include "dinghy.c"
 #undef main
 
+static int solid(const disc_t *d, int32_t x, int32_t y)    /* (x, y) in Q4 */
+{
+    int32_t dx = x - ax_x[d->ax], dy = y - ax_y[d->ax];
+    int32_t r = (int32_t)isqrt((uint32_t)(dx * dx + dy * dy)) / 4;
+    return disc_px(d, r, iatan2(dy, dx)) != 0;
+}
+
 int main(void)
 {
     uint32_t k, step, a, bad = 0;
@@ -16,20 +23,17 @@ int main(void)
         for (step = 0; step < 2000u; step++) {          /* the master angle over a full cycle of the train */
             int32_t mx, my, x, y;
             Qm = (uint32_t)((uint64_t)step * QWRAP / 2000u);
-            for (a = 0; a < NAX; a++) {
-                ax_cx[a] = ax_x[a];
-                ax_cy[a] = ax_y[a];
+            for (a = 0; a < NAX; a++)
                 ax_th[a] = ((uint32_t)((int32_t)Qm / 120 * K[a] + (int32_t)(Qm % 120u) * K[a] / 120) + ax_c[a]) & 0xFFFFu;
-            }
             /* the pitch point: on the line between the centres, at a's pitch radius */
             mx = ax_x[da->ax] + (ax_x[db->ax] - ax_x[da->ax]) * da->n / (da->n + db->n);
             my = ax_y[da->ax] + (ax_y[db->ax] - ax_y[da->ax]) * da->n / (da->n + db->n);
             for (y = my - 10 * Q4; y <= my + 10 * Q4; y += Q4 / 2)
                 for (x = mx - 10 * Q4; x <= mx + 10 * Q4; x += Q4 / 2) {
-                    int32_t ca = disc_at(da, x, y, 1, 0, 0, 0), cb = disc_at(db, x, y, 1, 0, 0, 0);
-                    int32_t dx = x - ax_x[db->ax], dy = y - ax_y[db->ax];
-                    if (ca > 200 && cb > 200) overlap++;
-                    if (ca > 200 && (uint32_t)(dx * dx + dy * dy) < (uint32_t)(db->rt - Q4) * (uint32_t)(db->rt - Q4)) engaged++;
+                    int ca = solid(da, x, y), cb = solid(db, x, y);
+                    int32_t dx = (x - ax_x[db->ax]) / 4, dy = (y - ax_y[db->ax]) / 4;   /* 1/4 px */
+                    if (ca && cb) overlap++;
+                    if (ca && dx * dx + dy * dy < (db->rt - 4) * (db->rt - 4)) engaged++;
                 }
         }
         printf("mesh %u: disc %u (%u teeth) -> disc %u (%u teeth): %u points overlap, %u engaged\n",

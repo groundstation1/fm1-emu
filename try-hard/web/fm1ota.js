@@ -119,12 +119,13 @@ export class Updater {
     const outs = [...this.access.outputs.values()];
     for (const input of this.access.inputs.values()) {
       if (input.state === "disconnected") continue;
-      if (!/fm-1|felucca|melodee|sloop|dinghy|ota|composite|sinco|usb-midi/i.test(input.name || "")) continue;   // never probe other gear (Try Hard: installs over the family too)
+      if (!/fm-1|felucca|melodee|sloop|dinghy|ota|composite|sinco|usb-midi/i.test(input.name || "")) { this.log(`skip "${input.name}": not an FM-1 name`); continue; }   // never probe other gear (Try Hard: installs over the family too)
       const output = outs.find((o) => o.name === input.name && o.state !== "disconnected");
-      if (!output) continue;
-      try { await input.open(); await output.open(); } catch (_) { continue; }
+      if (!output) { this.log(`skip "${input.name}": no output of that name`); continue; }
+      try { await input.open(); await output.open(); } catch (e) { this.log(`skip "${input.name}": cannot open it (${e?.message || e}; another app has it?)`); continue; }
       const link = new Link(input, output);
       const id = await handshake(link, 2);
+      this.log(`"${input.name}": ${id ? `answers ${id.text}` : "no answer to the handshake"}`);
       if (id && (!filter || filter(id))) return { link, id, name: input.name };
       link.close();
     }

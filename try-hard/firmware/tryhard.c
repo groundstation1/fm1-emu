@@ -87,8 +87,11 @@ static inline void px_put(uint32_t i, int32_t r, int32_t g, int32_t b)
  * Compound gears: a wheel and a pinion share an axle and turn together. Three heights (z 0..2): a pinion
  * drives the wheel of the next axle on its own height. All teeth have one module (M px), so meshing gears
  * sit their pitch radii apart (M * (N1 + N2) / 2) and their tooth phases are set so that a tooth always
- * meets a gap (gears_init). Axle a turns K[a] / 120 as fast as axle 0, the ratios of the teeth. */
-#define Q4 16                                   /* positions and radii in 1/16 px */
+ * meets a gap (gears_init). Axle a turns K[a] / 120 as fast as axle 0, the ratios of the teeth.
+ *
+ * Drawn flat and fast: the axles stay put, so each has a table of every pixel's distance and angle from
+ * it, made once. A frame is then table lookups and compares per pixel: no square root, no arctangent. */
+#define Q4 16                                   /* positions in 1/16 px */
 #define M 4                                     /* module: px of pitch diameter per tooth */
 #define NAX 5
 #define NDISC 7
@@ -104,24 +107,27 @@ static inline void px_put(uint32_t i, int32_t r, int32_t g, int32_t b)
 #define GAP 8                                   /* backlash: meshing centres this much further apart (Q4) */
 #endif
 #define FLANK_K ((256 << 18) / (ROOT_U - TIP_U))
+#define CLOCK_H 144                             /* the clockwork and its shadows: rows 0..143 */
 
 typedef struct {
     uint8_t ax, z, n, spokes;                   /* axle, height, teeth, spokes (0: solid) */
     uint8_t r, g, b;                            /* the metal */
     uint8_t top;                                /* the top disc of its axle: the jewel */
-    int32_t rt, rr, rim, hub;                   /* tip, root, rim inside, hub outside (Q4) */
-    int32_t spk_hw, spk_k;                      /* spoke half width (Q4), 2 pi * 4096 / spokes */
+    int32_t rt, rr, rim, hub;                   /* tip, root, rim inside, hub outside (1/4 px) */
+    uint16_t face, hubc, dark, lite;            /* colours, as cv_px holds them */
+    uint8_t edge[256];                          /* the outline's radius (1/4 px) by place in a tooth */
+    uint16_t win[192], wino[192];               /* a window starts past this place between spokes, by radius */
 } disc_t;
 
 static disc_t disc[NDISC] = {
-    /* ax z  n  sp   metal             */
-    {0, 0, 18, 5, 200, 160, 76, 0, 0, 0, 0, 0, 0, 0},   /* W0: brass, the big one */
-    {0, 1, 8, 0, 182, 188, 198, 0, 0, 0, 0, 0, 0, 0},   /* P0: steel pinion on W0 */
-    {1, 1, 16, 5, 214, 176, 96, 0, 0, 0, 0, 0, 0, 0},   /* W1: brass, driven by P0 */
-    {1, 2, 7, 0, 182, 188, 198, 0, 0, 0, 0, 0, 0, 0},   /* P1: steel pinion on W1 */
-    {2, 2, 12, 4, 204, 124, 80, 0, 0, 0, 0, 0, 0, 0},   /* W2: copper, driven by P1 */
-    {3, 0, 10, 3, 156, 166, 186, 0, 0, 0, 0, 0, 0, 0},  /* W3: blued steel, driven by W0 */
-    {4, 2, 14, 6, 200, 160, 76, 0, 0, 0, 0, 0, 0, 0},   /* W4: brass, driven by W2 */
+    /* ax z  n  sp   metal */
+    {0, 0, 18, 5, 200, 160, 76},                /* W0: brass, the big one */
+    {0, 1, 8, 0, 182, 188, 198},                /* P0: steel pinion on W0 */
+    {1, 1, 16, 5, 214, 176, 96},                /* W1: brass, driven by P0 */
+    {1, 2, 7, 0, 182, 188, 198},                /* P1: steel pinion on W1 */
+    {2, 2, 12, 4, 204, 124, 80},                /* W2: copper, driven by P1 */
+    {3, 0, 10, 3, 156, 166, 186},               /* W3: blued steel, driven by W0 */
+    {4, 2, 14, 6, 200, 160, 76},                /* W4: brass, driven by W2 */
 };
 static const int32_t K[NAX] = {120, -60, 35, -216, -30};
 /* the meshes, in order from axle 0: disc i drives disc j, axle j's centre in direction PHI from axle i's */
@@ -131,14 +137,30 @@ static const struct { uint8_t i, j; uint16_t phi; } MESH[NAX - 1] = {
     {0, 5, 27307},                              /* W0 -> W3, 150 */
     {4, 6, 59711},                              /* W2 -> W4, -32 */
 };
-static int32_t ax_x[NAX], ax_y[NAX];            /* axle centres (Q4), at rest */
+static int32_t ax_x[NAX], ax_y[NAX];            /* axle centres (Q4) */
 static uint32_t ax_c[NAX];                      /* phase of each axle */
-static int32_t ax_cx[NAX], ax_cy[NAX];          /* this frame: centres with the float */
 static uint32_t ax_th[NAX];                     /* this frame: angles */
+static uint8_t ZORD[NDISC];                     /* the discs, bottom up */
+
+/* the tables: per axle, a box of pixels around it, each with its angle and distance (1/4 px) */
+#define TAB_MAX 26000
+static uint16_t tab_a[TAB_MAX] __attribute__((section(".pool")));
+static uint8_t tab_r[TAB_MAX] __attribute__((section(".pool")));
+static uint16_t bg[CLOCK_H * 240] __attribute__((section(".pool")));   /* the ground with its shadows */
+static struct { int32_t x0, y0, w, h; uint32_t at; } tab[NAX];
+
+static uint16_t col(int32_t r, int32_t g, int32_t b)
+{
+    r = r < 0 ? 0 : r > 255 ? 255 : r;
+    g = g < 0 ? 0 : g > 255 ? 255 : g;
+    b = b < 0 ? 0 : b > 255 ? 255 : b;
+    return swap16(RGB(r, g, b));
+}
 
 static void gears_init(void)
 {
-    uint32_t i, k;
+    uint32_t i, k, used = 0;
+    int32_t z;
     ax_x[0] = 72 * Q4;
     ax_y[0] = 74 * Q4;
     ax_c[0] = 0;
@@ -156,109 +178,105 @@ static void gears_init(void)
     }
     for (i = 0; i < NDISC; i++) {
         disc_t *d = &disc[i];
-        int32_t pr = M * Q4 * d->n / 2;
-        uint32_t j;
-        d->rt = pr + M * Q4;
-        d->rr = pr - (M * Q4 * 115) / 100;
-        d->rim = d->rr - 4 * Q4;
-        d->hub = pr * 3 / 10 < 6 * Q4 ? 6 * Q4 : pr * 3 / 10;
-        d->spk_hw = 22 * Q4 / 10;
-        d->spk_k = d->spokes ? 25736 / d->spokes : 0;
+        int32_t pr = M * 4 * d->n / 2, j, u;   /* the pitch radius, 1/4 px */
+        d->rt = pr + M * 4;
+        d->rr = pr - (M * 4 * 115) / 100;
+        d->rim = d->rr - 4 * 4;
+        d->hub = pr * 3 / 10 < 6 * 4 ? 6 * 4 : pr * 3 / 10;
         d->top = 1;
         for (j = 0; j < NDISC; j++)
-            if (j != i && disc[j].ax == d->ax && disc[j].z > d->z) d->top = 0;
-    }
-}
-
-/* the colour of a disc at a point: 0..256 coverage, and the shaded metal into *r *g *b when r != 0.
- * px, py: the point (Q4); blur: the edge's width in px (1 sharp, more for a soft shadow). */
-static int32_t disc_at(const disc_t *d, int32_t px, int32_t py, int32_t blur, int32_t *cr, int32_t *cg, int32_t *cb)
-{
-    int32_t dx = px - ax_cx[d->ax], dy = py - ax_cy[d->ax], pad = (blur + 1) * Q4 / 2, kq = 256 / blur;
-    int32_t r, su, us, prof, edge, cov, cut = 0, L, nrm, bev = 0, t = 0, sv = 0;
-    uint32_t a, u;
-    if (dx > d->rt + pad || dx < -d->rt - pad || dy > d->rt + pad || dy < -d->rt - pad)
-        return 0;
-    r = (int32_t)isqrt((uint32_t)(dx * dx + dy * dy));
-    if (r > d->rt + pad)
-        return 0;
-    a = iatan2(dy, dx);
-    /* the teeth: u is the place within a tooth, 0 at its middle; a trapezoid with rounded corners */
-    u = ((a - ax_th[d->ax]) * d->n) & 0xFFFFu;
-    su = (int16_t)u;
-    us = su < 0 ? -su : su;
-    if (us < TIP_U) prof = 256;                 /* the tip land */
-    else if (us > ROOT_U) prof = 0;             /* the root */
-    else {
-        prof = ((ROOT_U - us) * FLANK_K) >> 18; /* the flank */
-        prof = (prof * prof * (768 - 2 * prof)) >> 16;   /* smoothstep: rounded */
-    }
-    edge = d->rr + (((d->rt - d->rr) * prof) >> 8);
-    cov = clamp256(128 + (((edge - r) * kq) >> 4));
-    if (!cov)
-        return 0;
-    if (r < 2 * Q4 + pad && !d->top)            /* the axle hole (the top disc has the jewel) */
-        cut = clamp256(128 + (((2 * Q4 - r) * kq) >> 4));
-    if (d->spokes && r > d->hub - pad && r < d->rim + pad) {   /* the windows between the spokes */
-        int32_t ang, w;
-        sv = (int16_t)(((a - ax_th[d->ax]) * d->spokes) & 0xFFFFu);
-        ang = ((sv < 0 ? -sv : sv) * d->spk_k) >> 16;          /* radians, Q12 */
-        t = (r * ang) >> 12;                    /* px from the spoke's middle line (Q4) */
-        w = clamp256(128 + (((t - d->spk_hw) * kq) >> 4));
-        if (w > clamp256(128 + (((r - d->hub) * kq) >> 4))) w = clamp256(128 + (((r - d->hub) * kq) >> 4));
-        if (w > clamp256(128 + (((d->rim - r) * kq) >> 4))) w = clamp256(128 + (((d->rim - r) * kq) >> 4));
-        if (w > cut) cut = w;
-    }
-    cov = (cov * (256 - cut)) >> 8;
-    if (!cr || !cov)
-        return cov;
-
-    if (d->top && r < 11 * Q4 / 2) {            /* the jewel: a ruby in a gold setting */
-        if (r < 3 * Q4) {
-            int32_t hx = dx + Q4, hy = dy + Q4, h = hx * hx + hy * hy, l = 256 - (r * 40 >> 4);
-            *cr = 190 * l >> 8; *cg = 22 * l >> 8; *cb = 48 * l >> 8;
-            if (h < 20 * Q4 * Q4 / 10) { *cr = 255; *cg = 214; *cb = 222; }
-        } else {
-            L = 220 + ((cos16(a - LIGHT) * 80) >> 15);
-            *cr = 226 * L >> 8; *cg = 184 * L >> 8; *cb = 92 * L >> 8;
+            if (j != (int32_t)i && disc[j].ax == d->ax && disc[j].z > d->z) d->top = 0;
+        d->face = col(d->r, d->g, d->b);
+        d->hubc = col(d->r * 5 / 4, d->g * 5 / 4, d->b * 5 / 4);
+        d->dark = col(d->r * 2 / 5, d->g * 2 / 5, d->b * 2 / 5);
+        d->lite = col(d->r * 3 / 2, d->g * 3 / 2, d->b * 3 / 2);
+        for (j = 0; j < 256; j++) {             /* the teeth: a trapezoid with rounded corners */
+            int32_t us = j << 7, prof;
+            if (us < TIP_U) prof = 256;
+            else if (us > ROOT_U) prof = 0;
+            else {
+                prof = ((ROOT_U - us) * FLANK_K) >> 18;
+                prof = (prof * prof * (768 - 2 * prof)) >> 16;
+            }
+            d->edge[j] = (uint8_t)(d->rr + (((d->rt - d->rr) * prof) >> 8));
         }
-        return cov;
+        for (u = 0; u < 192; u++) {             /* the spokes: 2.2 px half wide, so wider in angle near the hub */
+            int32_t a1 = u ? 10430 * 9 * d->spokes / u : 32767, a2 = u ? 10430 * 13 * d->spokes / u : 32767;
+            d->win[u] = (uint16_t)(a2 > 32767 ? 32767 : a2);    /* past the spoke and its outline */
+            d->wino[u] = (uint16_t)(a1 > 32767 ? 32767 : a1);   /* past the spoke */
+        }
     }
-    /* brushed metal: a conic sheen that stays with the light while the disc turns */
-    L = 196 + ((cos16(2u * (a - LIGHT)) * 44) >> 15);
-    nrm = -1;
-    if (r < d->hub) {                           /* the hub: raised, turned rings */
-        L += 22;
-        if (((r >> 4) % 3) == 0) L -= 14;
-        if (d->hub - r < 3 * Q4 / 2) { nrm = (int32_t)a; bev = 150; }
-        if (r < 3 * Q4) { nrm = (int32_t)(a + 32768u); bev = 120; }   /* down into the axle hole */
-    } else if (edge - r < 2 * Q4) {             /* the outer edge: the teeth's chamfer */
-        nrm = (int32_t)a;
-        if (prof > 8 && prof < 248)
-            nrm = (int32_t)(a + (uint32_t)(su > 0 ? 12000 : -12000));   /* a flank faces sideways */
-        bev = 130;
-    } else if (d->spokes && r > d->hub) {      /* a window's edges: chamfers down into it */
-        if (r < d->hub + 3 * Q4 / 2 && t > d->spk_hw) { nrm = (int32_t)a; bev = 120; }
-        else if (r > d->rim - 3 * Q4 / 2 && r <= d->rim + Q4 / 2 && t > d->spk_hw) { nrm = (int32_t)(a + 32768u); bev = 120; }
-        else if (r < d->rim && t > d->spk_hw - 3 * Q4 / 2 && t <= d->spk_hw + Q4 / 2)
-            { nrm = (int32_t)(a + (uint32_t)(sv > 0 ? 16384 : -16384)); bev = 120; }
-        if (r > d->rim) L -= 10;                /* the rim: a step lower than the teeth's face */
-    } else if (!d->spokes && r < d->hub + 3 * Q4 / 2 && r > d->hub) {
-        L -= 30;                                /* a pinion: the groove around its hub */
+    for (k = 0, z = 0; z < 3; z++)
+        for (i = 0; i < NDISC; i++)
+            if (disc[i].z == z) ZORD[k++] = (uint8_t)i;
+    for (k = 0; k < NAX; k++) {                 /* the tables: each axle's box, as big as its biggest disc */
+        int32_t rt = 0, x, y, cx = ax_x[k], cy = ax_y[k];
+        for (i = 0; i < NDISC; i++)
+            if (disc[i].ax == k && disc[i].rt > rt) rt = disc[i].rt;
+        rt = rt / 4 + 1;
+        tab[k].x0 = cx / Q4 - rt;
+        tab[k].y0 = cy / Q4 - rt;
+        tab[k].w = tab[k].h = 2 * rt + 1;
+        tab[k].at = used;
+        for (y = 0; y < tab[k].h; y++)
+            for (x = 0; x < tab[k].w; x++) {
+                int32_t dx = (tab[k].x0 + x) * Q4 + Q4 / 2 - cx, dy = (tab[k].y0 + y) * Q4 + Q4 / 2 - cy;
+                uint32_t r = isqrt((uint32_t)(dx * dx + dy * dy)) / 4u;   /* 1/4 px */
+                if (used >= TAB_MAX) break;
+                tab_a[used] = (uint16_t)iatan2(dy, dx);
+                tab_r[used] = (uint8_t)(r > 255u ? 255u : r);
+                used++;
+            }
     }
-    if (nrm >= 0) {
-        int32_t lam = cos16((uint32_t)nrm - LIGHT);   /* -32767..32767 */
-        L += (lam * bev) >> 15;
-        if (lam > 0) L += (((lam * lam) >> 15) * 70) >> 15;   /* the glint */
+    /* the ground: deep blue to plum, a vignette, and a soft round shadow under each disc */
+    {
+        int32_t x, y;
+        for (y = 0; y < CLOCK_H; y++)
+            for (x = 0; x < 240; x++) {
+                int32_t r = 16 + y * 22 / 240, g = 18 + y * 4 / 240, b = 34 + y * 22 / 240, v, s = 0;
+                v = (x - 120) * (x - 120) / 900;
+                for (i = 0; i < NDISC; i++) {
+                    const disc_t *d = &disc[i];
+                    int32_t h = 6 + d->z * 3, dx = x * 4 + 2 - (ax_x[d->ax] / 4 + h * 2), dy = y * 4 + 2 - (ax_y[d->ax] / 4 + h * 3);
+                    int32_t rad = (d->rr + d->rt) / 2, dd = (int32_t)isqrt((uint32_t)(dx * dx + dy * dy)), c;
+                    c = (rad - dd) * 256 / (4 * 4) + 128;          /* a 4 px soft edge */
+                    c = c < 0 ? 0 : c > 256 ? 256 : c;
+                    if (c > s) s = c;
+                }
+                r = (r - v) * (256 - s * 3 / 5) >> 8;
+                g = (g - v) * (256 - s * 3 / 5) >> 8;
+                b = (b - v) * (256 - s * 3 / 5) >> 8;
+                bg[y * 240 + x] = col(r, g, b);
+            }
     }
-    if (L < 40) L = 40;
-    *cr = d->r * L >> 8;
-    *cg = d->g * L >> 8;
-    *cb = d->b * L >> 8;
-    return cov;
 }
 
-/* ---------------------------------------------------------------- text, scaled and blended */
+/* disc d at distance r (1/4 px) and angle a: 0 open, 1 the face, 2 the outline, 3 the hub, 4 the lit rim,
+ * 5 the jewel. tests/mesh_test.c turns the train with this. */
+static int disc_px(const disc_t *d, int32_t r, uint32_t a)
+{
+    uint32_t rel = a - ax_th[d->ax], u;
+    int32_t us, edge, sv;
+    if (r >= d->rt) return 0;
+    u = (rel * d->n) & 0xFFFFu;
+    us = (int16_t)u;
+    if (us < 0) us = -us;
+    edge = d->edge[(uint32_t)us >> 7 > 255u ? 255u : (uint32_t)us >> 7];
+    if (r >= edge) return 0;
+    if (edge - r <= 4) return 2;                /* the outline, 1 px */
+    if (r < 3 * 4) return d->top ? 5 : 2;       /* the axle: a jewel on the top disc */
+    if (r < d->hub) return d->hub - r <= 4 ? 2 : 3;
+    if (d->spokes && r < d->rim + 4) {
+        sv = (int16_t)((rel * d->spokes) & 0xFFFFu);
+        if (sv < 0) sv = -sv;
+        if (r < d->rim && r > d->hub + 4 && sv > d->win[r]) return 0;   /* a window */
+        if (sv > d->wino[r]) return 2;          /* its edge */
+    }
+    if (edge - r <= 12 && (uint32_t)((a - LIGHT + 10000u) & 0xFFFFu) < 20000u) return 4;   /* the lit rim */
+    return 1;
+}
+
+/* ---------------------------------------------------------------- the title and the status, when they change */
 static void glyph_draw(int32_t x, int32_t y, uint32_t gi, int32_t s, int32_t y0, int32_t y1,
                        int32_t cr, int32_t cg, int32_t cb, int32_t alpha)
 {   /* glyph gi of FONT_L (or FONT_S when s < 0, unscaled) at (x, y), scale s/256, into strip rows y0..y1 */
@@ -277,7 +295,8 @@ static void glyph_draw(int32_t x, int32_t y, uint32_t gi, int32_t s, int32_t y0,
                 b = gd[yy * bpr + xx / 2];
                 v[k] = (xx & 1) ? (b & 15) : (b >> 4);
             }
-            if (fx < 0) { tx = 0; } if (fy < 0) { ty = 0; }
+            if (fx < 0) tx = 0;
+            if (fy < 0) ty = 0;
             a = ((v[0] * (256 - tx) + v[1] * tx) * (256 - ty) + (v[2] * (256 - tx) + v[3] * tx) * ty) >> 16;   /* 0..15 */
             a = (a * 273 >> 4) * alpha >> 8;
             if (a > 0) {
@@ -299,179 +318,90 @@ static void text_small(int32_t x, int32_t y, const char *s, int32_t cr, int32_t 
     }
 }
 
-/* ---------------------------------------------------------------- the screen, a strip at a time */
 #define STRIP 48
 static const char TITLE[] = "TRY HARD";
 static const uint8_t TCOL[8][3] = {
     {255, 214, 64}, {255, 156, 52}, {255, 96, 140}, {0, 0, 0}, {178, 124, 255}, {72, 212, 232},
     {124, 232, 124}, {255, 214, 64}};
-static int32_t title_s, title_x, wave;          /* scale, left edge, how much the letters jump */
-static int32_t th_kick;                         /* speed the panel gave the gears since the last frame */
+static int32_t title_s, title_x;                /* the title's scale and left edge */
+static int32_t th_kick;                         /* how far the knobs turned the gears since the last frame (Qm units) */
 static uint32_t Qm;                             /* the master angle: axle 0 at Qm / 120 */
-static int32_t lift;                            /* the float height above the ground (Q4) */
 static char line1[40], line2[40];
 static int linked;
-static uint16_t frame_no;                       /* frames drawn: the shadow grids are this frame's when stamped so */
 
-static void frame_setup(uint32_t now)
+/* the gears stand still until a knob turns: then they glide to where the knobs put them */
+static void frame_setup(void)
 {
-    static uint32_t last;
-    static int32_t speed_x;                     /* extra speed from playing, decays */
-    uint32_t dt = now - last, a;
-    int32_t bob;
-    if (dt > 200u) dt = 200u;
-    last = now;
-    speed_x += th_kick;
+    static int32_t target;
+    int32_t diff;
+    uint32_t a;
+    target = (target + th_kick % QWRAP + QWRAP) % QWRAP;
     th_kick = 0;
-    Qm = (uint32_t)(((int32_t)Qm + ((linked ? 400 : 160) + speed_x) * (int32_t)dt) % QWRAP + QWRAP) % QWRAP;
-    speed_x -= (speed_x * (int32_t)dt) >> 9;
-    if (wave > 0) wave -= (int32_t)dt / 2 + 1;
-    if (wave < 0) wave = 0;
-    bob = (sine(now * 1431655u) * 3 * Q4) >> 15;          /* +-3 px, every 3 s */
-    lift = 8 * Q4 + bob;
-    frame_no++;                                 /* (the shadow grids are stale now) */
-    for (a = 0; a < NAX; a++) {
-        ax_cx[a] = ax_x[a];
-        ax_cy[a] = ax_y[a] - bob;
-        ax_th[a] = (uint32_t)((int32_t)Qm / 120 * K[a] + (int32_t)(Qm % 120u) * K[a] / 120) + ax_c[a];
-        ax_th[a] &= 0xFFFFu;
-    }
+    diff = target - (int32_t)Qm;                /* the short way round */
+    if (diff > QWRAP / 2) diff -= QWRAP;
+    if (diff < -QWRAP / 2) diff += QWRAP;
+    diff = diff / 3 ? diff / 3 : diff;          /* a third of the way each frame */
+    Qm = (uint32_t)(((int32_t)Qm + diff) % QWRAP + QWRAP) % QWRAP;
+    for (a = 0; a < NAX; a++)
+        ax_th[a] = ((uint32_t)((int32_t)Qm / 120 * K[a] + (int32_t)(Qm % 120u) * K[a] / 120) + ax_c[a]) & 0xFFFFu;
 }
 
-/* Shadows are soft, so they are worked out on a coarse grid once a frame and blended between its points:
- * on the ground (every 4 px), and on the discs of heights 0 and 1 from those above (every 2 px). */
-#define CLOCK_H 152                             /* the clockwork and its shadows stay above this row */
-#define SG_W 61
-#define SG_H (CLOCK_H / 4 + 1)
-#define SD_W 121
-#define SD_H (CLOCK_H / 2 + 1)
-static uint8_t sg_mask[SG_H][SG_W], sd_mask[2][SD_H][SD_W];
-static uint16_t sg_done[SG_H], sd_done[SD_H];
-static uint8_t ZORD[NDISC];                     /* the discs, top down */
-
-static int32_t union_at(int32_t px, int32_t py, int32_t zmin, int32_t zrecv, int32_t ground)
-{   /* how much of (px, py) the discs at zmin and up shadow (0..255) */
-    int32_t i, s = 0;
-    for (i = 0; i < NDISC; i++) {
-        const disc_t *d = &disc[i];
-        int32_t h, c;
-        if (d->z < zmin) continue;
-        h = ground ? lift + d->z * 3 * Q4 : (d->z - zrecv) * 3 * Q4;
-        c = disc_at(d, px - h * 6 / 10, py - h * 8 / 10, ground ? 3 + h / (4 * Q4) : 2, 0, 0, 0);
-        if (c) s = s + c - ((s * c) >> 8);
-    }
-    return s > 255 ? 255 : s;
-}
-static void mask_rows(int32_t y)                /* the grid rows pixel row y blends between, once a frame */
-{
-    int32_t j, i, k;
-    for (k = 0; k < 2; k++) {
-        j = (y >> 2) + k;
-        if (j < SG_H && sg_done[j] != frame_no) {
-            sg_done[j] = frame_no;
-            for (i = 0; i < SG_W; i++)
-                sg_mask[j][i] = (uint8_t)union_at((i << 2) * Q4 + Q4 / 2, (j << 2) * Q4 + Q4 / 2, 0, 0, 1);
-        }
-        j = (y >> 1) + k;
-        if (j < SD_H && sd_done[j] != frame_no) {
-            sd_done[j] = frame_no;
-            for (i = 0; i < SD_W; i++) {
-                int32_t px = (i << 1) * Q4 + Q4 / 2, py = (j << 1) * Q4 + Q4 / 2;
-                sd_mask[0][j][i] = (uint8_t)union_at(px, py, 1, 0, 0);
-                sd_mask[1][j][i] = (uint8_t)union_at(px, py, 2, 1, 0);
-            }
-        }
-    }
-}
-static int32_t mask_at(const uint8_t *m, int32_t w, int32_t sh, int32_t x, int32_t y)
-{   /* grid m (w wide, a point every 1 << sh px) at pixel (x, y), blended */
-    int32_t i = x >> sh, j = y >> sh, fx = (x - (i << sh)) << (8 - sh), fy = (y - (j << sh)) << (8 - sh);
-    const uint8_t *p = m + j * w + i;
-    int32_t top = p[0] + (((p[1] - p[0]) * fx) >> 8), bot = p[w] + (((p[w + 1] - p[w]) * fx) >> 8);
-    return top + (((bot - top) * fy) >> 8);
-}
-
-static int8_t vig[240];                         /* the ground's vignette, by column */
-
-static void strip_draw(uint32_t s, uint32_t now)
+/* strip s of the screen (48 rows): the clockwork every frame, the words below only when asked */
+static void strip_draw(uint32_t s)
 {
     int32_t y0 = (int32_t)s * STRIP, y1 = y0 + STRIP, x, y, i;
     cv_begin(240, STRIP, C_BLACK);
-    for (y = y0; y < y1; y++) {                 /* the ground: deep blue to plum */
-        int32_t r = 16 + y * 22 / 240, g = 18 + y * 4 / 240, b = 34 + y * 22 / 240;
+    for (y = y0; y < y1; y++) {
         uint16_t *row = cv_px + (uint32_t)(y - y0) * 240u;
-        for (x = 0; x < 120; x++) {             /* (symmetric: each colour made once) */
-            int32_t v = vig[x], rr = r - v, gg = g - v, bb = b - v;
-            uint16_t c = swap16(RGB(rr < 0 ? 0 : rr, gg < 0 ? 0 : gg, bb < 0 ? 0 : bb));
-            row[x] = c;
-            row[239 - x] = c;
+        if (y < CLOCK_H) {
+            const uint16_t *b = bg + y * 240;
+            for (x = 0; x < 240; x++) row[x] = b[x];
+        } else {                                /* (as the ground above, without shadows) */
+            for (x = 0; x < 240; x++) {
+                int32_t v = (x - 120) * (x - 120) / 900;
+                row[x] = col(16 + y * 22 / 240 - v, 18 + y * 4 / 240 - v, 34 + y * 22 / 240 - v);
+            }
         }
     }
-    /* TRY HARD: big, each letter bobbing on its own, a drop shadow under it */
-    {
+    for (i = 0; i < NDISC; i++) {               /* bottom up: each disc paints over the ones below */
+        const disc_t *d = &disc[ZORD[i]];
+        int32_t k = d->ax, ty0 = y0 - tab[k].y0, ty1 = y1 - tab[k].y0, ty;
+        if (ty0 < 0) ty0 = 0;
+        if (ty1 > tab[k].h) ty1 = tab[k].h;
+        for (ty = ty0; ty < ty1; ty++) {
+            const uint16_t *ta = tab_a + tab[k].at + (uint32_t)(ty * tab[k].w);
+            const uint8_t *tr = tab_r + tab[k].at + (uint32_t)(ty * tab[k].w);
+            uint16_t *row = cv_px + (uint32_t)(tab[k].y0 + ty - y0) * 240u;
+            int32_t tx, sx = tab[k].x0;
+            for (tx = 0; tx < tab[k].w; tx++) {
+                int32_t X = sx + tx, p;
+                if ((uint32_t)X >= 240u || tr[tx] >= d->rt) continue;
+                p = disc_px(d, tr[tx], ta[tx]);
+                if (p == 1) row[X] = d->face;
+                else if (p == 2) row[X] = d->dark;
+                else if (p == 3) row[X] = d->hubc;
+                else if (p == 4) row[X] = d->lite;
+                else if (p == 5) row[X] = tr[tx] < 4 ? col(255, 200, 210) : col(200, 24, 52);
+            }
+        }
+    }
+    if (y1 > CLOCK_H) {                         /* TRY HARD, and the link with what went out last */
         int32_t px0 = title_x, k;
         for (k = 0; TITLE[k]; k++) {
             uint32_t gi = glyph(&FONT_L, (uint8_t)TITLE[k]);
-            int32_t adv = (FONT_L.adv[gi] * title_s) >> 8;
-            int32_t ly = 150 + ((sine(now * 715828u + (uint32_t)k * 600000000u) * (4 + wave / 16)) >> 15);
-            int32_t dh = (FONT_L.h * title_s) >> 8;
-            if (TITLE[k] != ' ' && ly - 2 < y1 && ly + dh + 6 > y0) {
+            int32_t ly = 150 + ((k & 1) ? 3 : -3);             /* a playful up and down */
+            if (TITLE[k] != ' ') {
                 glyph_draw(px0 + 3, ly + 4, gi, title_s, y0, y1, 6, 4, 14, 170);
                 glyph_draw(px0, ly, gi, title_s, y0, y1, TCOL[k][0], TCOL[k][1], TCOL[k][2], 256);
             }
-            px0 += adv;
+            px0 += (FONT_L.adv[gi] * title_s) >> 8;
         }
-    }
-    /* the link, and what went out last */
-    {
-        int32_t on = linked || ((now / 500u) & 1u);
-        if (y0 < 230 && y1 > 202) {
-            int32_t cx = 14, cy = 213, rr;
-            for (y = y0 < 206 ? 206 : y0; y < 221 && y < y1; y++)
-                for (x = 8; x < 21; x++) {
-                    rr = (x - cx) * (x - cx) + (y - cy) * (y - cy);
-                    if (rr <= 20 && on)
-                        px_put((uint32_t)(y - y0) * 240u + (uint32_t)x, linked ? 90 : 255, linked ? 230 : 170, linked ? 110 : 40);
-                }
-        }
+        for (y = y0 < 206 ? 206 : y0; y < 221 && y < y1; y++)  /* the dot */
+            for (x = 8; x < 21; x++)
+                if ((x - 14) * (x - 14) + (y - 213) * (y - 213) <= 20)
+                    px_put((uint32_t)(y - y0) * 240u + (uint32_t)x, linked ? 90 : 255, linked ? 230 : 170, linked ? 110 : 40);
         text_small(26, 205, line1, linked ? 200 : 230, linked ? 240 : 200, linked ? 210 : 150, y0, y1);
         text_small(26, 222, line2, 130, 120, 160, y0, y1);
-    }
-    /* the clockwork: from the top disc down, until a pixel is covered; the ground's shadow under the rest */
-    for (y = y0; y < y1 && y < CLOCK_H; y++) {
-        int32_t py = y * Q4 + Q4 / 2, nd = 0;
-        uint8_t row[NDISC];
-        for (i = 0; i < NDISC; i++)             /* the discs on this row, top down (disc order: by z) */
-            if (py > ax_cy[disc[ZORD[i]].ax] - disc[ZORD[i]].rt - Q4 && py < ax_cy[disc[ZORD[i]].ax] + disc[ZORD[i]].rt + Q4)
-                row[nd++] = ZORD[i];
-        mask_rows(y);
-        for (x = 0; x < 240; x++) {
-            int32_t px = x * Q4 + Q4 / 2, r = 0, g = 0, b = 0, T = 256, k, sg;
-            uint32_t idx = (uint32_t)(y - y0) * 240u + (uint32_t)x;
-            for (k = 0; k < nd && T; k++) {
-                const disc_t *d = &disc[row[k]];
-                int32_t dr, dg, db, c, s2;
-                if (px < ax_cx[d->ax] - d->rt - Q4 || px > ax_cx[d->ax] + d->rt + Q4) continue;
-                c = disc_at(d, px, py, 1, &dr, &dg, &db);
-                if (!c) continue;
-                if (d->z < 2 && (s2 = mask_at(sd_mask[d->z][0], SD_W, 1, x, y)) != 0) {   /* the discs above */
-                    dr -= (dr * s2 * 120) >> 16; dg -= (dg * s2 * 120) >> 16; db -= (db * s2 * 120) >> 16;
-                }
-                c = (c * T) >> 8;
-                r += (dr * c) >> 8; g += (dg * c) >> 8; b += (db * c) >> 8;
-                T -= c;
-            }
-            sg = mask_at(sg_mask[0], SG_W, 2, x, y);
-            if (T == 256 && !sg)
-                continue;                       /* bare ground */
-            if (T) {
-                int32_t gr, gg, gb;
-                px_get(idx, &gr, &gg, &gb);
-                gr -= (gr * sg * 150) >> 16; gg -= (gg * sg * 150) >> 16; gb -= (gb * sg * 150) >> 16;
-                r += (gr * T) >> 8; g += (gg * T) >> 8; b += (gb * T) >> 8;
-            }
-            px_put(idx, r, g, b);
-        }
     }
     cv_blit(0, (uint32_t)y0);
 }
@@ -537,13 +467,9 @@ static void panel_out(void)
             if (prev & m) midi_send(0x80u | CH, id, 0);
             midi_send(0x90u | CH, id, 127);
             said(id, 0, 0);
-            th_kick += 300;
-            wave = 256;
         } else if ((keys & m) && !(prev & m)) {
             midi_send(0x90u | CH, id, 127);
             said(id, 0, 0);
-            th_kick += 300;
-            wave = 256;
         }
         if (!(keys & m) && ((prev & m) || (pressed & m)))
             midi_send(0x80u | CH, id, 0);
@@ -552,7 +478,7 @@ static void panel_out(void)
     b = fm1_input_edges(&rel);
     for (k = 0; k < 14u; k++) {
         uint32_t m = 1u << k;
-        if (b & m) { midi_send(0x90u | CH, k, 127); said(k, 0, 0); th_kick += 300; wave = 256; }
+        if (b & m) { midi_send(0x90u | CH, k, 127); said(k, 0, 0); }
         if (rel & m) {
             midi_send(0x80u | CH, k, 0);
             if (fm1_in.buttons & m) midi_send(0x90u | CH, k, 127);
@@ -564,7 +490,7 @@ static void panel_out(void)
         v = 64 + d;
         midi_send(0xB0u | CH, 16u + k, (uint32_t)(v < 1 ? 1 : v > 127 ? 127 : v));
         said(k, d, 1);
-        th_kick += d * 900;                     /* a knob turns the gears, either way */
+        th_kick += d * (QWRAP / 36);             /* a detent: half a tooth of the big wheel, either way */
     }
     if ((v = master_read()) >= 0) {
         master_avg = master_avg < 0 ? v * 16 : master_avg + (v * 16 - master_avg) / 4;
@@ -572,6 +498,7 @@ static void panel_out(void)
         if ((v - master_sent > 3 || master_sent - v > 3 || (v != master_sent && (v == 0 || v == 1023)))
             && fm1_ms - t_master >= 10u) {
             t_master = fm1_ms;
+            if (master_sent >= 0) th_kick += (v - master_sent) * 3000;   /* MASTER turns them too */
             send_master(v);
             said(0, v, 2);
         }
@@ -615,19 +542,13 @@ static void leds(void)
     }
 }
 
+static int same(const char *a, const char *b) { while (*a && *a == *b) { a++; b++; } return *a == *b; }
+
 static void app_main(void)
 {
-    uint32_t s = 0;
+    uint32_t s = 0, words = 1;
+    char drawn1[40] = "", drawn2[40] = "";
     gears_init();
-    {
-        uint32_t i, n = 0;
-        int32_t z;
-        for (z = 2; z >= 0; z--)
-            for (i = 0; i < NDISC; i++)
-                if (disc[i].z == z) ZORD[n++] = (uint8_t)i;
-        for (i = 0; i < 240u; i++)
-            vig[i] = (int8_t)(((int32_t)i - 120) * ((int32_t)i - 120) / 900);
-    }
     title_s = (226 * 256) / text_w(&FONT_L, TITLE);
     if (title_s > 2 * 256) title_s = 2 * 256;
     title_x = (240 - ((text_w(&FONT_L, TITLE) * title_s) >> 8)) / 2;
@@ -638,8 +559,16 @@ static void app_main(void)
         midi_in();
         leds();
         put_s(line1, linked ? "linked to the emulator" : "waiting for the page");
-        if (s == 0) frame_setup(fm1_ms);
-        strip_draw(s, fm1_ms);
-        if (++s * STRIP >= 240u) s = 0;
+        if (s == 0) {
+            frame_setup();
+            if (!same(line1, drawn1) || !same(line2, drawn2)) {   /* the words changed: draw them too */
+                put_s(drawn1, line1);
+                put_s(drawn2, line2);
+                words = 1;
+            }
+        }
+        strip_draw(s);
+        s++;
+        if (s * STRIP >= (words ? 240u : (uint32_t)CLOCK_H)) { s = 0; words = 0; }
     }
 }

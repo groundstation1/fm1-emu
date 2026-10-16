@@ -122,6 +122,9 @@ $("go").addEventListener("click", async () => {
     if (k === "write") $("bar").value = ((74 + a) / total) * 100;
     if (k === "done") $("bar").value = 100;
   };
+  // what this browser sees: every port, so a "not found" says why (no ports, another name, no answer)
+  log(`MIDI inputs: ${[...midi.inputs.values()].map((p) => `"${p.name}" (${p.state}/${p.connection})`).join(", ") || "none"}`);
+  log(`MIDI outputs: ${[...midi.outputs.values()].map((p) => `"${p.name}" (${p.state}/${p.connection})`).join(", ") || "none"}`);
   try {
     const up = new Updater(midi, log);
     const ota = await up.find((id) => /^ota-/i.test(id.model));        // an update that was cut off: finish it
